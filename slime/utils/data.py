@@ -198,3 +198,54 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data
+
+class PRDataset:
+    def __init__(
+        self,
+        path,
+        tokenizer,
+        processor,
+        max_length,
+        *,
+        prompt_key="text",
+        multimodal_keys=None,
+        label_key=None,
+        tool_key=None,
+        metadata_key="metadata",
+        seed=42,
+        apply_chat_template=False,
+        apply_chat_template_kwargs=None,
+    ):
+        self.origin_samples = []
+        for data in read_file(path):
+            prompt = data[prompt_key]
+
+            metadata = data.get(metadata_key) or {}
+
+            self.origin_samples.append(
+                Sample(
+                    prompt=prompt,
+                    label=data[label_key] if label_key is not None else None,
+                    metadata=metadata,
+                )
+            )
+
+        self.epoch_id = -1
+        self.seed = seed
+        self.samples = self.origin_samples
+
+    def shuffle(self, new_epoch_id):
+        if self.epoch_id == new_epoch_id:
+            return
+
+        random.seed(self.seed + new_epoch_id)
+        permutation = list(range(len(self.samples)))
+        random.shuffle(permutation)
+        self.samples = [self.origin_samples[i] for i in permutation]
+        self.epoch_id = new_epoch_id
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+    def __len__(self):
+        return len(self.samples)

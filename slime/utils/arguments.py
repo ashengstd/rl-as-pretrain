@@ -388,6 +388,69 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_reward_rollout_arguments(parser):
+            parser.add_argument(
+                "--self-group-rm", action="store_true", default=False, help="Whether to do rm on a whole group."
+            )
+            parser.add_argument(
+                "--reward-rollout-temperature",
+                type=float,
+                default=1.0,
+                help="the temperature for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--reward-rollout-top-p",
+                type=float,
+                default=1.0,
+                help="the top-p for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--reward-rollout-top-k",
+                type=int,
+                default=-1,
+                help="the top-k for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--reward-rollout-max-response-len",
+                type=int,
+                default=1024,
+                help=(
+                    "The maximum length of the response for the inference engine during rollout. "
+                    "It is basically `max_tokens` in sglang."
+                ),
+            )
+            parser.add_argument(
+                "--reward-rollout-skip-special-tokens",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to skip special tokens in the response during rollout. "
+                    "This is useful when you want to use the response as a prompt for the next rollout."
+                ),
+            )
+            parser.add_argument(
+                "--reward-rollout-stop",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "The stop words for the inference engine during rollout. "
+                    "It can be a list of strings or a single string. "
+                    "It may be hard to pass special tokens in command line, in that case rollout_stop_token_ids can be used."
+                ),
+            )
+            parser.add_argument(
+                "--reward-rollout-stop-token-ids",
+                type=int,
+                nargs="+",
+                default=None,
+                help=(
+                    "The stop token ids for the inference engine during rollout. "
+                    "It can be a list of integers or a single integer."
+                ),
+            )
+            return parser
+
         def add_fault_tolerance_arguments(parser):
             parser.add_argument(
                 "--use-fault-tolerance",

@@ -1,10 +1,13 @@
 import asyncio
+import ast
 import copy
+import json
 import logging
 from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
+import re
 
 import numpy as np
 import sglang_router
@@ -87,7 +90,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False,) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
@@ -224,12 +227,14 @@ async def generate_and_rm(
             custom_generate_func = load_function(args.custom_generate_function_path)
             sample = await custom_generate_func(args, sample, sampling_params)
         else:
-            sample = await generate(args, sample, sampling_params)
+            sample = await generate(args, sample, sampling_params,evaluation=evaluation)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
         return sample
 
+    if args.self_group_rm and not evaluation:
+        return sample
     # multi samples
     if isinstance(sample, list):
         samples = sample
@@ -273,6 +278,11 @@ async def generate_and_rm_group(
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
         rewards = await batched_async_rm(args, group)
+        for sample, reward in zip(group, rewards, strict=False):
+            sample.reward = reward
+
+    if not state.aborted and args.self_group_rm:
+        rewards = await compute_group_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
@@ -538,6 +548,9 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+    with open(f"/nfs/ofs-llm-ssd/user/shengrenren_i/projects/slime/log/eval_rollout_{dataset_cfg.name}_{rollout_id}.jsonl", "w") as f:
+        for sample in data:
+            f.write(json.dumps(sample.to_dict()) + "\n")
     return {
         dataset_cfg.name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
@@ -579,3 +592,95 @@ def generate_abortable_samples(
     if evaluation:
         return run(eval_rollout(args, rollout_id))
     return run(generate_rollout_async(args, rollout_id, data_source))
+
+class CLSTokenizer(metaclass=SingletonMeta):
+    def __init__(self, args:Namespace) -> None:
+        self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+        self.sampling_params: dict[str, Any] = dict(
+        temperature=args.reward_rollout_temperature,
+        top_p=args.reward_rollout_top_p,
+        top_k=args.reward_rollout_top_k,
+        max_new_tokens=args.reward_rollout_max_response_len,
+        stop=args.reward_rollout_stop,
+        stop_token_ids=args.reward_rollout_stop_token_ids,
+        skip_special_tokens=args.reward_rollout_skip_special_tokens,
+        no_stop_trim=True,
+        spaces_between_special_tokens=False,
+    )
+async def extract_rewards(text:str, length:int) -> list[float]:
+    m = re.search(r'<rewards>\s*(\[.*?\])\s*</rewards>', text, re.S)
+    if not m:
+        rewards = [0.0] * length
+        logger.warning(f"No rewards tag found in response: {text}, treating all as 0.0")
+        return rewards
+    else:
+        try:
+            rewards = ast.literal_eval(m.group(1))
+            if not isinstance(rewards, list) or len(rewards) != length or not all(isinstance(r, (int, float)) for r in rewards):
+                logger.warning(f"Failed to extract rewards from response: {text}, treating all as 0.0")
+                rewards = [0.0] * length
+            else:
+                logger.info(f"Extracted rewards: {rewards} from response: {text}")
+                return [float(r) for r in rewards]
+        except Exception:
+            logger.warning(f"Failed to extract rewards from response: {text}, treating all as 0.0")
+            rewards = [0.0] * length
+        return rewards
+
+async def compute_group_rm(args: Namespace, group: list[Sample], **kwargs) -> list[float]:
+    tok = CLSTokenizer(args=args)
+    text_prompt = f"""
+You are an evaluator model. Your task is to evaluate multiple model responses generated from the SAME input prompt.
+
+### Input Prompt
+"{group[0].prompt}"
+
+### Evaluation Rules (Fixed-Length Responses with Progress Consideration)
+1. Compare all the responses in the group against the same input prompt.
+2. Score based on quality, correctness, relevance, helpfulness, and the amount of the query addressed relative to the fixed length.
+3. Score range: 0.0 to 1.0, where:
+   - 1.0 = excellent response given the length constraint and maximal coverage of the query possible
+   - 0.0 = completely incorrect / irrelevant
+4. Each response is exactly {len(group[0].response)} tokens. Responses are fixed-length and not complete answers; judge:
+   - Correctness – information or answer must be accurate
+   - Relevance – focus on the prompt, avoid off-topic content, answer the question asked
+   - Helpfulness – useful and informative within the length limit
+   - Completeness/Progress – if one of the query successfully addresses more aspects of the prompt than others within the fixed length, it should receive a higher score. But we don't expect full coverage due to length limit.
+5. Find the best response in the group that maximally addresses the prompt within the fixed length, assign it a score of 1.0 and other responses proportionally lower scores based on their relative quality and progress.
+6. You may reason step by step or provide commentary, but the final output list must be enclosed in <rewards>...</rewards>.
+
+### Output Format (IMPORTANT)
+- You can write your reasoning, commentary, or evaluation outside the <rewards> tag.
+- The **final JSON list of floats must appear inside a single <rewards>...</rewards> tag**.
+
+### Few-Shot Examples
+
+#### Example
+Input Prompt:
+"Solve the equation: 2x + 3 = 7. Let's find x step by step."
+
+Responses:
+1. "First, we subtract 3 from both sides to get 2x = 4."
+2. "To solve the problem, we need to do some calculations."
+
+Example reasoning:
+"Response 1 make clear and right progress towards solving the equation. Response 2 is vague and does not address the prompt."
+
+Expected Output:
+<rewards>[0.92, 0.05]</rewards>
+
+--------------------
+### Responses to Evaluate ({len(group)} total)
+"""
+    for i, g in enumerate(group):
+        text_prompt += f"Response {i+1}: {g.response}\n"
+
+    text_prompt += "### End of Responses\n"
+    text_prompt += "\nReturn the JSON list now:"
+    messages = [{"role": "user", "content": text_prompt}]
+    prompt = tok.tokenizer.apply_chat_template(messages, tokenize=False,add_generation_prompt=False,)
+    rm_sample = Sample(group_index=group[0].group_index, prompt=prompt, index=0)
+    generated_text = await generate(args, rm_sample, tok.sampling_params)
+    rewards = await extract_rewards(generated_text.response, length=len(group))
+    
+    return rewards

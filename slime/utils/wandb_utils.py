@@ -1,8 +1,10 @@
 import logging
 import os
 from copy import deepcopy
-
+import weave
 import wandb
+import swanlab
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,7 @@ def init_wandb_primary(args):
         os.makedirs(args.wandb_dir, exist_ok=True)
         init_kwargs["dir"] = args.wandb_dir
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
-
+    swanlab.sync_wandb()
     wandb.init(**init_kwargs)
 
     _init_wandb_common()
